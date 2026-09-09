@@ -1,1 +1,839 @@
+/*
+ * ============================================================================
+ * SMART FERTILIZER SYSTEM — MQTT EDITION
+ * SEABI TECH INNOVATIONS
+ * ============================================================================
+ */
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ==================== WIFI ====================
+const char* ssid     = "Sterpark Access Point1";
+const char* password = "99592776";
+
+// ==================== MQTT ====================
+const char* MQTT_BROKER   = "broker.hivemq.com";
+const int   MQTT_PORT     = 1883;
+const char* DEVICE_ID     = "fert01";   // change if you run more than one unit
+
+String MQTT_TELEMETRY_TOPIC;  // smartfertilizer/fert01/telemetry  (device -> app)
+String MQTT_COMMAND_TOPIC;    // smartfertilizer/fert01/command    (app -> device)
+String MQTT_STATUS_TOPIC;     // smartfertilizer/fert01/status     (device -> app, on-demand + retained)
+
+WiFiClient mqttClient;
+bool mqttConnected = false;
+unsigned long lastMqttAttempt = 0;
+const unsigned long MQTT_RETRY_INTERVAL = 5000;
+unsigned long lastPingSent = 0;
+const unsigned long MQTT_KEEPALIVE_MS = 40000; // must be < the 60s keepalive we CONNECT with
+
+bool manualPumpControl = false;
+unsigned long lastStatusSent = 0;
+const unsigned long STATUS_INTERVAL = 30000;
+
+// ==================== TFT PINS ====================
+#define TFT_CS    15
+#define TFT_RST   4
+#define TFT_DC    2
+#define TFT_MOSI  23
+#define TFT_MISO  19
+#define TFT_SCK   18
+
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+
+// ==================== SENSOR PINS ====================
+#define SOIL_PIN 34
+#define DHT_PIN  27
+#define PUMP_PIN 26
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ==================== SOIL CALIBRATION ====================
+#define SOIL_DRY_VALUE 4095
+#define SOIL_WET_VALUE 1500
+#define SOIL_FERTILIZER_LIMIT 40
+
+// ==================== PUMP ====================
+bool pumpState = false;
+unsigned long pumpStartTime = 0;
+const unsigned long MIN_PUMP_TIME = 3000;
+
+// ==================== PAGE CONTROL ====================
+int currentPage = 1;
+unsigned long pageStartTime = 0;
+const unsigned long PAGE_TIME = 20000;
+
+// ==================== SENSOR TIMER ====================
+unsigned long sensorTimer = 0;
+const unsigned long SENSOR_INTERVAL = 2000;
+
+// ==================== COLORS ====================
+#define BG_COLOR        0xE7F5
+#define HEADER_GREEN    0x3666
+#define CARD_COLOR      0xD6ED
+#define CARD_BORDER     0x5D87
+
+#define DARK_GREEN      0x13A0
+#define GREEN           0x3666
+#define LIGHT_GREEN     0x7FE0
+
+#define RED             0xF800
+#define YELLOW          0xFD20
+
+#define DARK_TEXT       0x18C3
+#define GREY_TEXT      0x52AA
+
+#define WHITE           ILI9341_WHITE
+#define BLACK           ILI9341_BLACK
+
+// ==================== SENSOR VARIABLES ====================
+int moisturePercent = 0;
+float temperature = 0;
+float humidity = 0;
+String soilCondition = "GOOD";
+
+// ---- Fertilizer recommendation (expanded) ----
+String fertilizerNeeded  = "NOT NEEDED"; // short label, kept for TFT display
+String fertilizerRatio   = "NOT NEEDED"; // e.g. "NPK 15:15:15"
+String fertilizerUrgency = "NONE";       // CRITICAL / HIGH / MODERATE / LOW / NONE
+String fertilizerRate    = "0g per m2";  // application rate guidance
+int nitrogenPct   = 0;
+int phosphorusPct = 0;
+int potassiumPct  = 0;
+String fertilizerNotes = "";
+
+// ==================== CROP DATABASE ====================
+// Each crop also carries its own ideal NPK blend, since the "one blend fits
+// the whole field" recommendation above is a fallback — once we know which
+// crop is being grown, its own ratio is more useful.
+struct Crop {
+  const char* name;
+  int minMoisture;
+  int maxMoisture;
+  const char* idealFertilizer;
+};
+
+Crop crops[] = {
+  {"Maize",     50, 70, "NPK 20:10:10 (nitrogen-rich, vegetative growth)"},
+  {"Potatoes",  60, 75, "NPK 15:15:30 (potassium-rich, tuber development)"},
+  {"Tomatoes",  60, 80, "NPK 10:20:20 (phosphorus & potassium, fruiting)"},
+  {"Spinach",   50, 80, "NPK 25:10:10 (nitrogen-rich, leafy growth)"},
+  {"Onions",    60, 80, "NPK 15:20:15 (balanced, bulb formation)"},
+  {"Cabbage",   60, 80, "NPK 20:15:15 (nitrogen-phosphorus, head formation)"},
+  {"Macadamia", 50, 70, "NPK 10:15:25 (potassium-rich, tree/nut crop)"}
+};
+
+const int numberOfCrops = sizeof(crops) / sizeof(crops[0]);
+
+String crop1 = "";
+String crop2 = "";
+String crop3 = "";
+String crop1Fertilizer = "";
+String crop2Fertilizer = "";
+String crop3Fertilizer = "";
+
+// ==================== SOIL MOISTURE ====================
+int getMoisture(int rawValue) {
+  rawValue = constrain(rawValue, SOIL_WET_VALUE, SOIL_DRY_VALUE);
+  int percentage = map(rawValue, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
+  return constrain(percentage, 0, 100);
+}
+
+// ==================== SOIL CONDITION ====================
+void updateSoilCondition() {
+  if (moisturePercent >= SOIL_FERTILIZER_LIMIT)
+    soilCondition = "GOOD";
+  else
+    soilCondition = "BAD";
+}
+
+// ==================== FERTILIZER RECOMMENDATION (expanded) ====================
+// Five moisture bands instead of three, each with: a general NPK ratio, an
+// urgency level, an application-rate guideline, an approximate N-P-K percent
+// breakdown, and a short agronomic note. This is the "whole field" fallback
+// recommendation shown when no specific crop is selected — the per-crop
+// ratios in the Crop table above take precedence once a crop is known.
+void updateFertilizer() {
+  if (moisturePercent < 20) {
+    fertilizerRatio   = "NPK 10:10:10";
+    fertilizerUrgency = "CRITICAL";
+    fertilizerRate    = "200g per m2";
+    nitrogenPct = 10; phosphorusPct = 10; potassiumPct = 10;
+    fertilizerNotes   = "Severe moisture deficit — irrigate before or alongside fertilizing to avoid root burn.";
+  } else if (moisturePercent < 40) {
+    fertilizerRatio   = "NPK 15:15:15";
+    fertilizerUrgency = "HIGH";
+    fertilizerRate    = "150g per m2";
+    nitrogenPct = 15; phosphorusPct = 15; potassiumPct = 15;
+    fertilizerNotes   = "Soil is dry — balanced feed recommended to support root uptake.";
+  } else if (moisturePercent < 60) {
+    fertilizerRatio   = "NPK 20:20:20";
+    fertilizerUrgency = "MODERATE";
+    fertilizerRate    = "100g per m2";
+    nitrogenPct = 20; phosphorusPct = 20; potassiumPct = 20;
+    fertilizerNotes   = "Moisture approaching adequate — standard balanced feeding.";
+  } else if (moisturePercent < 80) {
+    fertilizerRatio   = "NPK 5:5:5 (maintenance)";
+    fertilizerUrgency = "LOW";
+    fertilizerRate    = "50g per m2";
+    nitrogenPct = 5; phosphorusPct = 5; potassiumPct = 5;
+    fertilizerNotes   = "Soil condition good — light maintenance feed only.";
+  } else {
+    fertilizerRatio   = "NOT NEEDED";
+    fertilizerUrgency = "NONE";
+    fertilizerRate    = "0g per m2";
+    nitrogenPct = 0; phosphorusPct = 0; potassiumPct = 0;
+    fertilizerNotes   = "Soil is saturated — withhold fertilizer to avoid nutrient runoff/leaching.";
+  }
+
+  fertilizerNeeded = fertilizerRatio; // short label used by the TFT display
+}
+
+// ==================== CROP RECOMMENDATION ====================
+void findCropRecommendations() {
+  crop1 = ""; crop1Fertilizer = "";
+  crop2 = ""; crop2Fertilizer = "";
+  crop3 = ""; crop3Fertilizer = "";
+  int found = 0;
+
+  for (int i = 0; i < numberOfCrops; i++) {
+    if (moisturePercent >= crops[i].minMoisture && moisturePercent <= crops[i].maxMoisture) {
+      if (found == 0) { crop1 = crops[i].name; crop1Fertilizer = crops[i].idealFertilizer; }
+      else if (found == 1) { crop2 = crops[i].name; crop2Fertilizer = crops[i].idealFertilizer; }
+      else if (found == 2) { crop3 = crops[i].name; crop3Fertilizer = crops[i].idealFertilizer; }
+      found++;
+      if (found >= 3) break;
+    }
+  }
+
+  if (found == 0) {
+    // Fallback picks by name — look up each one's ideal fertilizer from the table
+    const char* fallbackNames[3];
+    if (moisturePercent < 40) {
+      fallbackNames[0] = "Maize"; fallbackNames[1] = "Onions"; fallbackNames[2] = "Macadamia";
+    } else {
+      fallbackNames[0] = "Tomatoes"; fallbackNames[1] = "Cabbage"; fallbackNames[2] = "Spinach";
+    }
+    String* names[3] = {&crop1, &crop2, &crop3};
+    String* ferts[3] = {&crop1Fertilizer, &crop2Fertilizer, &crop3Fertilizer};
+    for (int slot = 0; slot < 3; slot++) {
+      *names[slot] = fallbackNames[slot];
+      for (int i = 0; i < numberOfCrops; i++) {
+        if (String(crops[i].name) == fallbackNames[slot]) {
+          *ferts[slot] = crops[i].idealFertilizer;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// ==================== READ ALL SENSORS ====================
+void readSensors() {
+  int rawSoil = analogRead(SOIL_PIN);
+  moisturePercent = getMoisture(rawSoil);
+  updateSoilCondition();
+
+  float newHumidity = dht.readHumidity();
+  float newTemperature = dht.readTemperature();
+
+  if (!isnan(newHumidity)) humidity = newHumidity;
+  if (!isnan(newTemperature)) temperature = newTemperature;
+
+  updateFertilizer();
+  findCropRecommendations();
+
+  Serial.print("Soil Moisture: ");
+  Serial.print(moisturePercent);
+  Serial.print("% | Soil Condition: ");
+  Serial.print(soilCondition);
+  Serial.print(" | Temperature: ");
+  Serial.print(temperature);
+  Serial.print(" C | Humidity: ");
+  Serial.print(humidity);
+  Serial.println("%");
+}
+
+// ==================== START/STOP PUMP ====================
+void startPump() {
+  if (pumpState) return;
+  pumpState = true;
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpStartTime = millis();
+  Serial.println("PUMP ON");
+}
+
+void stopPump() {
+  if (!pumpState) return;
+  pumpState = false;
+  digitalWrite(PUMP_PIN, LOW);
+  Serial.println("PUMP OFF");
+}
+
+void automaticPumpControl() {
+  if (manualPumpControl) return;
+
+  if (moisturePercent >= SOIL_FERTILIZER_LIMIT) {
+    stopPump();
+  } else {
+    startPump();
+  }
+}
+
+// ============================================================================
+// MQTT — hand-rolled MQTT 3.1.1, same variable-length-encoding fix as the
+// livestock tracker firmware. Kept as ONE PERSISTENT connection (not
+// connect/publish/disconnect per message) because this device also needs to
+// receive commands, not just send telemetry.
+// ============================================================================
+
+void writeMqttRemainingLength(WiFiClient &client, int length) {
+  do {
+    uint8_t encodedByte = length % 128;
+    length = length / 128;
+    if (length > 0) {
+      encodedByte |= 0x80;
+    }
+    client.write(encodedByte);
+  } while (length > 0);
+}
+
+// Reads a variable-length "remaining length" field from an incoming packet.
+// Returns -1 if the bytes aren't available yet (caller should back off and
+// retry later rather than blocking).
+int readMqttRemainingLength(WiFiClient &client) {
+  int multiplier = 1;
+  int value = 0;
+  uint8_t encodedByte;
+  int guard = 0;
+  do {
+    unsigned long start = millis();
+    while (!client.available()) {
+      if (millis() - start > 1000) return -1; // timeout waiting for next byte
+    }
+    encodedByte = client.read();
+    value += (encodedByte & 0x7F) * multiplier;
+    multiplier *= 128;
+    guard++;
+  } while ((encodedByte & 0x80) != 0 && guard < 4);
+  return value;
+}
+
+void mqttSendConnect() {
+  String clientId = "esp32_" + String(DEVICE_ID) + "_" + String(random(1000, 9999));
+  uint8_t varHeader[] = { 0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x02, 0x00, 0x3C }; // clean session, 60s keepalive
+  int clientLen = clientId.length();
+  int remLen = sizeof(varHeader) + 2 + clientLen;
+
+  mqttClient.write((uint8_t)0x10); // CONNECT
+  writeMqttRemainingLength(mqttClient, remLen);
+  mqttClient.write(varHeader, sizeof(varHeader));
+  mqttClient.write((uint8_t)(clientLen >> 8));
+  mqttClient.write((uint8_t)(clientLen & 0xFF));
+  mqttClient.print(clientId);
+}
+
+void mqttSendSubscribe(const String &topic) {
+  int topicLen = topic.length();
+  uint16_t packetId = 1;
+  // variable header (packet id) + topic length prefix + topic + QoS byte
+  int remLen = 2 + 2 + topicLen + 1;
+
+  mqttClient.write((uint8_t)0x82); // SUBSCRIBE (flags 0x2 required by spec)
+  writeMqttRemainingLength(mqttClient, remLen);
+  mqttClient.write((uint8_t)(packetId >> 8));
+  mqttClient.write((uint8_t)(packetId & 0xFF));
+  mqttClient.write((uint8_t)(topicLen >> 8));
+  mqttClient.write((uint8_t)(topicLen & 0xFF));
+  mqttClient.print(topic);
+  mqttClient.write((uint8_t)0x00); // QoS 0
+}
+
+bool mqttConnect() {
+  Serial.println("[MQTT] Connecting to broker...");
+  if (!mqttClient.connect(MQTT_BROKER, MQTT_PORT)) {
+    Serial.println("[MQTT] TCP connection failed.");
+    return false;
+  }
+
+  mqttSendConnect();
+
+  unsigned long start = millis();
+  bool acked = false;
+  while (millis() - start < 2000) {
+    if (mqttClient.available() >= 4) {
+      uint8_t ack[4];
+      mqttClient.read(ack, 4);
+      if (ack[0] == 0x20 && ack[3] == 0x00) acked = true;
+      break;
+    }
+    delay(10);
+  }
+
+  if (!acked) {
+    Serial.println("[MQTT] CONNACK not received / rejected.");
+    mqttClient.stop();
+    return false;
+  }
+
+  mqttSendSubscribe(MQTT_COMMAND_TOPIC);
+
+  // Drain the SUBACK (4 bytes: fixed header, remaining length, packet id x2, return code)
+  start = millis();
+  while (millis() - start < 1500 && mqttClient.available() < 5) delay(10);
+  while (mqttClient.available()) mqttClient.read(); // discard SUBACK bytes
+
+  Serial.println("[MQTT] Connected and subscribed to " + MQTT_COMMAND_TOPIC);
+  lastPingSent = millis();
+  return true;
+}
+
+void mqttPublish(const String &topic, const String &payload) {
+  if (!mqttConnected) return;
+
+  int topicLen = topic.length();
+  int msgLen = payload.length();
+  int remLen = 2 + topicLen + msgLen;
+
+  mqttClient.write((uint8_t)0x30); // PUBLISH, QoS 0
+  writeMqttRemainingLength(mqttClient, remLen);
+  mqttClient.write((uint8_t)(topicLen >> 8));
+  mqttClient.write((uint8_t)(topicLen & 0xFF));
+  mqttClient.print(topic);
+  mqttClient.print(payload);
+}
+
+// Builds one crop-recommendation JSON object, or an empty string if that
+// slot wasn't filled (so the array only contains real matches).
+String buildCropJson(const String &name, const String &fert) {
+  if (name == "") return "";
+  return "{\"name\":\"" + name + "\",\"ideal_fertilizer\":\"" + fert + "\"}";
+}
+
+// Full telemetry payload — every sensor reading, the whole-field fertilizer
+// recommendation (ratio, urgency, application rate, N-P-K breakdown, notes),
+// and the matched crop recommendations each with their own ideal blend.
+void publishTelemetry() {
+  String cropsJson = "[";
+  bool firstCrop = true;
+  String c1 = buildCropJson(crop1, crop1Fertilizer);
+  String c2 = buildCropJson(crop2, crop2Fertilizer);
+  String c3 = buildCropJson(crop3, crop3Fertilizer);
+  if (c1 != "") { cropsJson += c1; firstCrop = false; }
+  if (c2 != "") { cropsJson += (firstCrop ? "" : ",") + c2; firstCrop = false; }
+  if (c3 != "") { cropsJson += (firstCrop ? "" : ",") + c3; }
+  cropsJson += "]";
+
+  String json = "{";
+  json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"soil_moisture\":" + String(moisturePercent) + ",";
+  json += "\"soil_condition\":\"" + soilCondition + "\",";
+  json += "\"temperature\":" + String(temperature, 1) + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"fertilizer\":{";
+  json +=   "\"ratio\":\"" + fertilizerRatio + "\",";
+  json +=   "\"urgency\":\"" + fertilizerUrgency + "\",";
+  json +=   "\"application_rate\":\"" + fertilizerRate + "\",";
+  json +=   "\"nitrogen_pct\":" + String(nitrogenPct) + ",";
+  json +=   "\"phosphorus_pct\":" + String(phosphorusPct) + ",";
+  json +=   "\"potassium_pct\":" + String(potassiumPct) + ",";
+  json +=   "\"notes\":\"" + fertilizerNotes + "\"";
+  json += "},";
+  json += "\"crop_recommendations\":" + cropsJson + ",";
+  json += "\"pump_state\":" + String(pumpState ? "true" : "false") + ",";
+  json += "\"mode\":\"" + String(manualPumpControl ? "manual" : "automatic") + "\"";
+  json += "}";
+
+  mqttPublish(MQTT_TELEMETRY_TOPIC, json);
+  Serial.println("[MQTT] Telemetry published (" + String(json.length()) + " bytes).");
+}
+
+void publishStatus() {
+  // Same payload shape as telemetry — kept as a separate topic so the PWA
+  // can request/display "last known status" independent of the rolling feed.
+  publishTelemetry();
+}
+
+// Handles ONE incoming command payload (mirrors the Telegram command set).
+void handleCommand(const String &payload) {
+  String cmd = payload;
+  cmd.trim();
+  cmd.toLowerCase();
+
+  Serial.println("[MQTT] Command received: " + cmd);
+
+  if (cmd == "pump_on") {
+    startPump();
+    manualPumpControl = true;
+  } else if (cmd == "pump_off") {
+    stopPump();
+    manualPumpControl = true;
+  } else if (cmd == "auto") {
+    manualPumpControl = false;
+    automaticPumpControl();
+  } else if (cmd == "status") {
+    publishStatus();
+    return; // status already published, no need to re-publish below
+  } else {
+    Serial.println("[MQTT] Unknown command, ignoring.");
+    return;
+  }
+
+  publishTelemetry(); // reflect the new state immediately
+}
+
+// Non-blocking check for one incoming PUBLISH packet from the broker.
+// Call frequently from loop(). Also sends PINGREQ on the keepalive interval.
+void mqttLoop() {
+  if (!mqttConnected) return;
+
+  if (!mqttClient.connected()) {
+    Serial.println("[MQTT] Connection dropped.");
+    mqttConnected = false;
+    return;
+  }
+
+  if (millis() - lastPingSent > MQTT_KEEPALIVE_MS) {
+    mqttClient.write((uint8_t)0xC0); // PINGREQ
+    mqttClient.write((uint8_t)0x00);
+    lastPingSent = millis();
+  }
+
+  if (mqttClient.available() > 0) {
+    uint8_t header = mqttClient.read();
+    uint8_t packetType = header & 0xF0;
+    int remLen = readMqttRemainingLength(mqttClient);
+    if (remLen < 0) return; // timed out reading length, drop this cycle
+
+    if (packetType == 0x30) { // PUBLISH
+      uint8_t lenBytes[2];
+      mqttClient.readBytes(lenBytes, 2);
+      int topicLen = (lenBytes[0] << 8) | lenBytes[1];
+
+      char topicBuf[64];
+      int toRead = min(topicLen, 63);
+      mqttClient.readBytes(topicBuf, toRead);
+      topicBuf[toRead] = '\0';
+      // discard any extra topic bytes beyond our buffer
+      for (int i = toRead; i < topicLen; i++) mqttClient.read();
+
+      int payloadLen = remLen - 2 - topicLen;
+      String payload = "";
+      for (int i = 0; i < payloadLen; i++) {
+        if (mqttClient.available() || mqttClient.connected()) {
+          unsigned long waitStart = millis();
+          while (!mqttClient.available() && millis() - waitStart < 500) delay(1);
+          if (mqttClient.available()) payload += (char)mqttClient.read();
+        }
+      }
+
+      if (String(topicBuf) == MQTT_COMMAND_TOPIC) {
+        handleCommand(payload);
+      }
+    } else if (packetType == 0xD0) {
+      // PINGRESP — nothing to do, just drained the header+length already
+    } else {
+      // Unhandled packet type (e.g. another SUBACK) — drain remaining bytes
+      for (int i = 0; i < remLen; i++) {
+        unsigned long waitStart = millis();
+        while (!mqttClient.available() && millis() - waitStart < 200) delay(1);
+        if (mqttClient.available()) mqttClient.read();
+      }
+    }
+  }
+}
+
+// ==================== TFT DRAWING FUNCTIONS (unchanged) ====================
+void drawCard(int x, int y, int w, int h) {
+  tft.fillRoundRect(x, y, w, h, 10, CARD_BORDER);
+  tft.fillRoundRect(x + 2, y + 2, w - 4, h - 4, 8, CARD_COLOR);
+}
+
+void drawHeader() {
+  tft.fillRect(0, 0, 320, 42, HEADER_GREEN);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(75, 7);
+  tft.print("SMART FERTILIZER");
+  tft.setTextSize(1);
+  tft.setCursor(119, 29);
+  tft.print("SYSTEM");
+}
+
+void drawFooter() {
+  tft.fillRect(0, 228, 320, 12, HEADER_GREEN);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(72, 231);
+  tft.print("SEABI TECH INNOVATIONS");
+}
+
+void drawPage1() {
+  tft.fillScreen(BG_COLOR);
+  drawHeader();
+
+  drawCard(8, 50, 148, 108);
+  tft.setTextSize(1);
+  tft.setTextColor(GREY_TEXT);
+  tft.setCursor(18, 61);
+  tft.print("SOIL CONDITION");
+
+  tft.setTextColor(DARK_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(35, 88);
+  tft.print("SOIL");
+  tft.setCursor(35, 112);
+  tft.print("CONDITION");
+
+  tft.setTextSize(2);
+  tft.setCursor(35, 139);
+  tft.print(moisturePercent);
+  tft.print("%");
+
+  if (soilCondition == "GOOD") {
+    tft.setTextColor(DARK_GREEN);
+  } else {
+    tft.setTextColor(RED);
+  }
+  tft.setTextSize(1);
+  tft.setCursor(108, 139);
+  tft.print(soilCondition);
+
+  drawCard(164, 50, 148, 108);
+  tft.setTextSize(1);
+  tft.setTextColor(GREY_TEXT);
+  tft.setCursor(174, 61);
+  tft.print("ENVIRONMENT");
+
+  tft.setTextColor(DARK_TEXT);
+  tft.setCursor(174, 82);
+  tft.print("TEMPERATURE");
+  tft.setTextSize(2);
+  tft.setCursor(174, 99);
+  tft.print(temperature, 0);
+  tft.print(" C");
+
+  tft.setTextSize(1);
+  tft.setCursor(174, 131);
+  tft.print("HUMIDITY ");
+  tft.print(humidity, 0);
+  tft.print("%");
+
+  drawCard(8, 167, 304, 55);
+  tft.setTextSize(1);
+  tft.setTextColor(GREY_TEXT);
+  tft.setCursor(18, 177);
+  tft.print("FERTILIZER NEEDED");
+
+  if (moisturePercent < 40) {
+    tft.setTextColor(RED);
+  } else {
+    tft.setTextColor(DARK_GREEN);
+  }
+  tft.setTextSize(2);
+  tft.setCursor(18, 197);
+  tft.print(fertilizerNeeded);
+
+  drawFooter();
+}
+
+void drawCropCard(int x, int y, String crop) {
+  tft.fillRoundRect(x, y, 185, 36, 7, WHITE);
+  tft.drawRoundRect(x, y, 185, 36, 7, CARD_BORDER);
+  tft.fillCircle(x + 14, y + 18, 5, GREEN);
+  tft.setTextColor(DARK_TEXT);
+  tft.setTextSize(1);
+  tft.setCursor(x + 27, y + 14);
+  tft.print(crop);
+}
+
+void drawPumpDisplay() {
+  drawCard(204, 50, 108, 172);
+  tft.setTextColor(GREY_TEXT);
+  tft.setTextSize(1);
+  tft.setCursor(236, 61);
+  tft.print("PUMP");
+
+  if (pumpState) {
+    tft.fillCircle(258, 110, 31, GREEN);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(235, 155);
+    tft.print("ON");
+    tft.setTextSize(1);
+    tft.setCursor(219, 180);
+    tft.print("FERTILIZING");
+  } else {
+    tft.fillCircle(258, 110, 31, RED);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(232, 155);
+    tft.print("OFF");
+    tft.setTextSize(1);
+    tft.setCursor(220, 180);
+    tft.print("STANDBY");
+  }
+}
+
+void drawPage2() {
+  tft.fillScreen(BG_COLOR);
+  drawHeader();
+
+  drawCard(8, 50, 188, 172);
+  tft.setTextSize(1);
+  tft.setTextColor(GREY_TEXT);
+  tft.setCursor(18, 61);
+  tft.print("CROP RECOMMENDATION");
+
+  if (crop1 != "") drawCropCard(15, 75, crop1);
+  if (crop2 != "") drawCropCard(15, 118, crop2);
+  if (crop3 != "") drawCropCard(15, 161, crop3);
+
+  drawPumpDisplay();
+  drawFooter();
+}
+
+void drawStartup() {
+  tft.fillScreen(BG_COLOR);
+  tft.fillRect(0, 0, 320, 8, HEADER_GREEN);
+  tft.setTextColor(DARK_TEXT);
+  tft.setTextSize(3);
+  tft.setCursor(54, 65);
+  tft.print("SMART");
+  tft.setCursor(40, 100);
+  tft.print("FERTILIZER");
+  tft.setTextSize(1);
+  tft.setTextColor(DARK_GREEN);
+  tft.setCursor(91, 142);
+  tft.print("SYSTEM");
+  tft.setTextColor(GREY_TEXT);
+  tft.setCursor(92, 164);
+  tft.print("FEED THE SOIL");
+  tft.setCursor(92, 179);
+  tft.print("FEED THE FUTURE");
+  tft.setTextColor(DARK_TEXT);
+  tft.setCursor(72, 210);
+  tft.print("SEABI TECH INNOVATIONS");
+  delay(2500);
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("SMART FERTILIZER SYSTEM");
+  Serial.println("SEABI TECH INNOVATIONS");
+  Serial.println("MQTT MODE");
+  Serial.println("================================");
+
+  MQTT_TELEMETRY_TOPIC = "smartfertilizer/" + String(DEVICE_ID) + "/telemetry";
+  MQTT_COMMAND_TOPIC   = "smartfertilizer/" + String(DEVICE_ID) + "/command";
+  MQTT_STATUS_TOPIC    = "smartfertilizer/" + String(DEVICE_ID) + "/status";
+
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+  dht.begin();
+
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.setSPISpeed(20000000);
+
+  tft.fillScreen(BG_COLOR);
+  delay(300);
+
+  drawStartup();
+  readSensors();
+  automaticPumpControl();
+
+  currentPage = 1;
+  pageStartTime = millis();
+  drawPage1();
+
+  // ---- Wi-Fi connection ----
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected, IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("Wi-Fi connection timed out – continuing without network.");
+  }
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.setSPISpeed(20000000);
+  if (currentPage == 1) drawPage1();
+  else drawPage2();
+
+  delay(500);
+
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    mqttConnected = mqttConnect();
+    if (mqttConnected) {
+      publishTelemetry(); // announce we're online, same spirit as the old startup Telegram message
+    }
+  }
+
+  Serial.println("SYSTEM READY");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  if (millis() - sensorTimer >= SENSOR_INTERVAL) {
+    sensorTimer = millis();
+    readSensors();
+    automaticPumpControl();
+
+    if (currentPage == 1) drawPage1();
+    else drawPage2();
+  }
+
+  if (millis() - pageStartTime >= PAGE_TIME) {
+    pageStartTime = millis();
+    if (currentPage == 1) {
+      currentPage = 2;
+      drawPage2();
+    } else {
+      currentPage = 1;
+      drawPage1();
+    }
+  }
+
+  // ---- MQTT: reconnect if needed, then service incoming commands ----
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttConnected && millis() - lastMqttAttempt >= MQTT_RETRY_INTERVAL) {
+      lastMqttAttempt = millis();
+      mqttConnected = mqttConnect();
+    }
+    mqttLoop();
+
+    if (mqttConnected && millis() - lastStatusSent >= STATUS_INTERVAL) {
+      lastStatusSent = millis();
+      publishTelemetry();
+    }
+  }
+}
 
